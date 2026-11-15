@@ -12,7 +12,7 @@ plan limits), directory + git branch (`*` = uncommitted changes), prompt-cache h
 Percentages: green < 50, yellow < 80, red ≥ 80.
 
 The two git calls run concurrently with a 500 ms timeout; untracked files are not scanned.
-About 1.8 ms per run vs 12.9 ms for the equivalent bash + jq script.
+About 2 ms per run (most of it is the git subprocess) vs 12.9 ms for the equivalent bash + jq script.
 
 ## Install
 
