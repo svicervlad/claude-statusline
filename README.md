@@ -11,8 +11,10 @@ model + effort, context usage, 5h / 7d plan limits with reset time, cost estimat
 plan limits), directory + git branch (`*` = uncommitted changes), prompt-cache hit ratio, session time, lines changed.
 Percentages: green < 50, yellow < 80, red ≥ 80.
 
-The two git calls run concurrently with a 500 ms timeout; untracked files are not scanned.
-About 2 ms per run (most of it is the git subprocess) vs 12.9 ms for the equivalent bash + jq script.
+Git info comes from [gix](https://github.com/GitoxideLabs/gitoxide), no `git` subprocess. The dirty check
+(`*`: modified or staged tracked files, untracked ignored) runs on its own thread with a 500 ms deadline,
+so a huge repo shows the branch without `*` instead of stalling.
+About 1.7 ms per run in a repo (2.1 ms with a `git` subprocess, 12.9 ms for a bash + jq script).
 
 ## Install
 

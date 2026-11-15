@@ -3,13 +3,10 @@
 //! Every field may be absent (rate_limits only for subscribers, after the first response).
 
 use std::io::Read;
-use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, TimeZone};
 use serde::Deserialize;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -142,19 +139,22 @@ fn limit_seg(label: &str, w: &Window, with_day: bool) -> Option<Seg> {
     Some(s)
 }
 
-/// Runs git with a hard timeout so a huge repo can't stall the status line.
-async fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .arg("--no-optional-locks")
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = timeout(Duration::from_millis(500), out).await.ok()?.ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+/// Branch and dirty flag via gix: no `git` subprocess. The dirty check runs on its own thread
+/// with a deadline, so a huge repo can't stall the status line (branch still shows).
+fn git_info(dir: &str) -> Option<(String, bool)> {
+    let repo = gix::discover(dir).ok()?;
+    let branch = match repo.head_name().ok()? {
+        Some(name) => name.shorten().to_string(),
+        None => repo.head_id().ok()?.shorten().ok()?.to_string(), // detached HEAD
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = repo.path().to_owned(); // Repository is !Send without gix "parallel"; reopen in thread
+    std::thread::spawn(move || {
+        let dirty = gix::open(path).ok().and_then(|r| r.is_dirty().ok()).unwrap_or(false);
+        let _ = tx.send(dirty);
+    });
+    let dirty = rx.recv_timeout(Duration::from_millis(500)).unwrap_or(false);
+    Some((branch, dirty))
 }
 
 /// Segments in priority order; the lowest ones are dropped when the line is too wide.
@@ -239,29 +239,20 @@ fn fit(segs: &[Seg], max: usize) -> String {
     out
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     // Bad input must still print something: a blank status line hides the failure.
     let input: Input = serde_json::from_str(&raw).unwrap_or_default();
 
     let dir = input.workspace.current_dir.clone().or_else(|| input.cwd.clone());
-    let git_info = match &dir {
-        Some(d) => {
-            // Both git calls run concurrently; -uno skips the slow untracked-file scan.
-            let (branch, status) = tokio::join!(
-                git(d, &["branch", "--show-current"]),
-                git(d, &["status", "--porcelain", "-uno"]),
-            );
-            branch.filter(|b| !b.is_empty()).map(|b| (b, status.is_some_and(|s| !s.is_empty())))
-        }
-        None => None,
-    };
+    let git_info = dir.as_deref().and_then(git_info);
 
     // COLUMNS is set by Claude Code (tput can't see the terminal); keep a margin for its padding.
     let cols = std::env::var("COLUMNS").ok().and_then(|c| c.parse::<usize>().ok()).unwrap_or(200);
     println!("{}", fit(&build(&input, git_info), cols.saturating_sub(4)));
+    // Don't wait for a dirty-check thread that missed its deadline.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
