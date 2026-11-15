@@ -3,6 +3,7 @@
 //! Every field may be absent (`rate_limits` only for subscribers, after the first response).
 
 use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, TimeZone};
@@ -176,8 +177,28 @@ fn git_info(dir: &str) -> Option<(String, bool)> {
     Some((branch, dirty))
 }
 
+/// Level of the `pechera` plugin (Ukrainian caveman mode), or `None` when it is disabled or `off`.
+/// The plugin keeps the level in `.pechera-mode`; absent or unknown means its default, `full`.
+fn pechera_level(claude_dir: &Path) -> Option<String> {
+    let settings = std::fs::read_to_string(claude_dir.join("settings.json")).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&settings).ok()?;
+    if settings
+        .pointer("/enabledPlugins/pechera@pechera")?
+        .as_bool()
+        != Some(true)
+    {
+        return None;
+    }
+    let level = std::fs::read_to_string(claude_dir.join(".pechera-mode")).unwrap_or_default();
+    match level.trim() {
+        "off" => None,
+        lvl @ ("lite" | "full" | "ultra") => Some(lvl.to_owned()),
+        _ => Some("full".to_owned()),
+    }
+}
+
 /// Segments in priority order; the lowest ones are dropped when the line is too wide.
-fn build(input: &Input, git_info: Option<(String, bool)>) -> Vec<Seg> {
+fn build(input: &Input, git_info: Option<(String, bool)>, pechera: Option<&str>) -> Vec<Seg> {
     let mut segs = Vec::new();
 
     let mut s = Seg::default().add(
@@ -189,6 +210,9 @@ fn build(input: &Input, git_info: Option<(String, bool)>) -> Vec<Seg> {
     }
     if input.fast_mode {
         s = s.add(MAG, " fast");
+    }
+    if let Some(level) = pechera {
+        s = s.add(YELLOW, &format!(" печера:{level}"));
     }
     segs.push(s);
 
@@ -301,13 +325,24 @@ fn main() {
         .clone()
         .or_else(|| input.cwd.clone());
     let git_info = dir.as_deref().and_then(git_info);
+    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map_or_else(
+        || Path::new(&std::env::var_os("HOME").unwrap_or_default()).join(".claude"),
+        Into::into,
+    );
+    let pechera = pechera_level(&claude_dir);
 
     // COLUMNS is set by Claude Code (tput can't see the terminal); keep a margin for its padding.
     let cols = std::env::var("COLUMNS")
         .ok()
         .and_then(|c| c.parse::<usize>().ok())
         .unwrap_or(200);
-    println!("{}", fit(&build(&input, git_info), cols.saturating_sub(4)));
+    println!(
+        "{}",
+        fit(
+            &build(&input, git_info, pechera.as_deref()),
+            cols.saturating_sub(4)
+        )
+    );
     // Don't wait for a dirty-check thread that missed its deadline.
     std::process::exit(0);
 }
@@ -333,18 +368,25 @@ mod tests {
     #[test]
     fn empty_input_prints_model_and_time() {
         let i: Input = serde_json::from_str("{}").unwrap();
-        assert_eq!(strip(&fit(&build(&i, None), 200)), "? │ 0h00m");
+        assert_eq!(strip(&fit(&build(&i, None, None), 200)), "? │ 0h00m");
     }
 
     #[test]
     fn cost_hidden_on_subscription() {
         let j = r#"{"cost":{"total_cost_usd":1.5},
             "rate_limits":{"five_hour":{"used_percentage":23.5}}}"#;
-        let line = strip(&fit(&build(&serde_json::from_str(j).unwrap(), None), 200));
+        let line = strip(&fit(
+            &build(&serde_json::from_str(j).unwrap(), None, None),
+            200,
+        ));
         assert!(line.contains("5h 24%") && !line.contains('$'), "{line}");
         let j = r#"{"cost":{"total_cost_usd":0.1234}}"#;
         assert!(
-            strip(&fit(&build(&serde_json::from_str(j).unwrap(), None), 200)).contains("≈$0.12")
+            strip(&fit(
+                &build(&serde_json::from_str(j).unwrap(), None, None),
+                200
+            ))
+            .contains("≈$0.12")
         );
     }
 
@@ -355,13 +397,49 @@ mod tests {
             "cost":{"total_duration_ms":5400000,"total_lines_added":120,"total_lines_removed":7}}"#;
         let i: Input = serde_json::from_str(j).unwrap();
         for max in [10, 30, 45, 200] {
-            let line = strip(&fit(&build(&i, None), max));
+            let line = strip(&fit(&build(&i, None, None), max));
             assert!(line.chars().count() <= max, "{max}: {line}");
         }
-        assert_eq!(strip(&fit(&build(&i, None), 31)), "Opus 5.5 high"); // 32 cells needed for ctx
+        // 32 cells needed for ctx
+        assert_eq!(strip(&fit(&build(&i, None, None), 31)), "Opus 5.5 high");
         assert_eq!(
-            strip(&fit(&build(&i, None), 32)),
+            strip(&fit(&build(&i, None, None), 32)),
             "Opus 5.5 high │ ctx ███░░ 63%/1M"
+        );
+    }
+
+    #[test]
+    fn pechera_level_follows_plugin_state_and_flag() {
+        let dir = std::env::temp_dir().join(format!("sl-pechera-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = |on: bool| {
+            let json = format!(r#"{{"enabledPlugins":{{"pechera@pechera":{on}}}}}"#);
+            std::fs::write(dir.join("settings.json"), json).unwrap();
+        };
+        let flag = |v: &str| std::fs::write(dir.join(".pechera-mode"), v).unwrap();
+
+        assert_eq!(pechera_level(&dir), None, "no settings.json");
+        settings(true);
+        assert_eq!(
+            pechera_level(&dir).as_deref(),
+            Some("full"),
+            "no flag means default"
+        );
+        flag("ultra\n");
+        assert_eq!(pechera_level(&dir).as_deref(), Some("ultra"));
+        flag("garbage");
+        assert_eq!(pechera_level(&dir).as_deref(), Some("full"));
+        flag("off");
+        assert_eq!(pechera_level(&dir), None);
+        flag("lite");
+        settings(false);
+        assert_eq!(pechera_level(&dir), None, "plugin disabled");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let i: Input = serde_json::from_str(r#"{"model":{"display_name":"Opus"}}"#).unwrap();
+        assert_eq!(
+            strip(&fit(&build(&i, None, Some("full")), 200)),
+            "Opus печера:full │ 0h00m"
         );
     }
 
